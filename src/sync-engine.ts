@@ -429,6 +429,19 @@ export class SyncEngine {
 		return true;
 	}
 
+	/** A file deleted after scanning must be reconsidered by the next sync. */
+	private async deferDeletedUpload(item: SyncPlanItem, stats: SyncStats, hooks: SyncHooks): Promise<boolean> {
+		if (item.action !== SyncAction.UploadNew && item.action !== SyncAction.UploadModified) return false;
+		if (this.app.vault.getAbstractFileByPath(item.path) || await this.onDisk(item.path)) return false;
+		// Missing storage does not establish a user deletion.
+		if (!(await this.storageAvailable(hooks))) {
+			this.halt ??= { kind: "storage" };
+		} else {
+			stats.skipped++;
+		}
+		return true;
+	}
+
 	/**
 	 * Runs the plan in three passes — creates, then updates, then deletes —
 	 * with a bounded number of transfers in flight inside each pass.
@@ -622,6 +635,10 @@ export class SyncEngine {
 
 		let failure: string | undefined;
 		try {
+			if (await this.deferDeletedUpload(item, live.stats, live.hooks)) {
+				if (queue) queue.finished(item);
+				return;
+			}
 			const file = this.app.vault.getAbstractFileByPath(item.path);
 			if (!(file instanceof TFile)) throw new Error(t("error.localMissing", { path: item.path }));
 			// Taken before the read. Should the file change in between, the
@@ -643,6 +660,10 @@ export class SyncEngine {
 			live.stats.uploaded++;
 			this.failureStreak = 0;
 		} catch (e) {
+			if (await this.deferDeletedUpload(item, live.stats, live.hooks)) {
+				if (queue) queue.finished(item);
+				return;
+			}
 			console.error(`[YaDisk Sync] Error processing ${item.path}:`, e);
 			failure = describeError(e);
 			live.stats.errors++;
@@ -671,7 +692,14 @@ export class SyncEngine {
 		switch (item.action) {
 			case SyncAction.UploadNew:
 			case SyncAction.UploadModified: {
-				await this.executeUpload(item);
+				if (await this.deferDeletedUpload(item, stats, hooks)) return false;
+				try {
+					await this.executeUpload(item);
+				} catch (error) {
+					// Deletion can also race the asynchronous read.
+					if (await this.deferDeletedUpload(item, stats, hooks)) return false;
+					throw error;
+				}
 				stats.uploaded++;
 				const local = localSnapshot[item.path];
 				if (local) {
