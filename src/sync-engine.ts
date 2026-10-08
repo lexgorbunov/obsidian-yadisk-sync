@@ -17,6 +17,10 @@ import type { QueueListener } from "./queue";
 import { DeletionGuard, findMassDeletions, restoreDeleted, settleUnfinished } from "./safety";
 import { t } from "./i18n";
 import { md5 } from "./md5";
+import { hashVaultFile, needsMobileTransfer, vaultFileBlob } from "./vault-io";
+import { mobileDownloadChunkBytes } from "./transfer-settings";
+import { ensureStagingFolder, replaceStaged } from "./staged-file";
+import { hashStream, withMobileUpload } from "./mobile-transfer";
 import { normalizeRemotePath, pathDepth, resolveWithin, runPool, yieldToUi } from "./utils";
 
 /** Paths to classify before handing the main thread back to the UI. */
@@ -624,15 +628,17 @@ export class SyncEngine {
 			// recorded time is older than the file's and the next scan hashes
 			// it afresh rather than trusting the hash below.
 			const mtime = file.stat.mtime;
-			const data = await this.app.vault.readBinary(file);
-			await this.client.uploadFile(this.client.toRemotePath(item.path), data);
-
-			// What was sent, not what the scan saw: the two sides now match
-			// on this content, and the snapshots must say so or the next run
-			// reads the file as changed on both sides.
-			const hash = md5(data);
-			live.localSnapshot[item.path] = { path: item.path, mtime, size: data.byteLength, md5: hash };
-			live.remoteSnapshot[item.path] = { path: item.path, mtime: Date.now(), size: data.byteLength, md5: hash };
+			const upload = async () => {
+    if (this.shouldStop()) throw new Error("Transfer cancelled");
+    const payload = needsMobileTransfer(file.stat.size) ? await vaultFileBlob(this.app, file) : await this.app.vault.readBinary(file);
+    const size = payload instanceof Blob ? payload.size : payload.byteLength;
+    const hash = payload instanceof Blob ? await hashStream(payload.stream().getReader(), () => this.shouldStop()) : md5(payload);
+    if (payload instanceof Blob) await this.client.uploadBlob(this.client.toRemotePath(item.path), payload, () => this.shouldStop());
+    else await this.client.uploadFile(this.client.toRemotePath(item.path), payload);
+    live.localSnapshot[item.path] = { path: item.path, mtime, size, md5: hash };
+    live.remoteSnapshot[item.path] = { path: item.path, mtime: Date.now(), size, md5: hash };
+   };
+   if (needsMobileTransfer(file.stat.size)) await withMobileUpload(upload); else await upload();
 			live.completed.add(item.path);
 			live.stats.uploaded++;
 			this.failureStreak = 0;
@@ -961,9 +967,15 @@ export class SyncEngine {
 		const file = this.app.vault.getAbstractFileByPath(item.path);
 		if (!file || !(file instanceof TFile)) throw new Error(t("error.localMissing", { path: item.path }));
 
-		const data = await this.app.vault.readBinary(file);
 		const remotePath = this.client.toRemotePath(item.path);
-		await this.client.uploadFile(remotePath, data);
+		if (needsMobileTransfer(file.stat.size)) {
+			await withMobileUpload(async () => {
+				if (this.shouldStop()) throw new Error("Transfer cancelled");
+				await this.client.uploadBlob(remotePath, await vaultFileBlob(this.app, file), () => this.shouldStop());
+			});
+		} else {
+			await this.client.uploadFile(remotePath, await this.app.vault.readBinary(file));
+		}
 	}
 
 	/**
@@ -978,6 +990,9 @@ export class SyncEngine {
 		if (this.hasLocalFileChanged(item)) return false;
 
 		const remotePath = this.client.toRemotePath(item.path);
+		if (item.remoteRecord && needsMobileTransfer(item.remoteRecord.size, mobileDownloadChunkBytes(this.settings.mobileDownloadChunkSizeMB))) {
+			return this.executeMobileDownload(item, hooks, remotePath);
+		}
 		const data = await this.client.downloadFile(remotePath);
 
 		// Re-checked after the transfer: the download itself is the long part,
@@ -1001,6 +1016,41 @@ export class SyncEngine {
 
 		return true;
 	}
+
+ private async executeMobileDownload(item: SyncPlanItem, hooks: SyncHooks, remotePath: string): Promise<boolean> {
+  const adapter = this.app.vault.adapter;
+  const folder = `${this.app.vault.configDir}/plugins/yadisk-sync/transfers`;
+  await ensureStagingFolder(adapter, folder);
+  const temp = `${folder}/${Date.now()}-${Math.random().toString(16).slice(2)}.part`;
+
+  try {
+   await adapter.writeBinary(temp, new ArrayBuffer(0));
+   const record = item.remoteRecord!;
+   if (!/^[a-f0-9]{32}$/i.test(record.md5)) throw new Error("Remote checksum required for a safe ranged download");
+   const hash = await this.client.downloadFileTo(remotePath, record.size, data => adapter.appendBinary(temp, data), () => this.shouldStop(), this.settings.mobileDownloadChunkSizeMB);
+   if (record.md5 && hash !== record.md5) throw new Error("Downloaded checksum mismatch; original preserved");
+   const stat = await adapter.stat(temp);
+   if (!stat || stat.size !== record.size) throw new Error("Downloaded size mismatch; original preserved");
+   if (this.shouldStop()) throw new Error("Transfer cancelled");
+   if (this.hasLocalFileChanged(item)) return false;
+   const parent = item.path.substring(0, item.path.lastIndexOf("/"));
+   if (parent) await this.ensureLocalFolder(parent, hooks);
+   if (hooks.onFileWritten) hooks.onFileWritten(item.path);
+   await replaceStaged(adapter, temp, item.path);
+   const written = await adapter.stat(item.path);
+   let visible = false;
+   for (let i = 0; i < 60; i++) {
+    const file = this.app.vault.getAbstractFileByPath(item.path);
+    if (file instanceof TFile && written && file.stat.size === written.size && Math.abs(file.stat.mtime - written.mtime) <= 1) { visible = true; break; }
+    await new Promise<void>(resolve => setTimeout(resolve, 50));
+   }
+   if (!visible) throw new Error("Downloaded file saved; waiting for Obsidian to update its index");
+   return true;
+  } finally {
+   if (await adapter.exists(temp)) await adapter.remove(temp);
+
+  }
+ }
 
 	private hasLocalFileChanged(item: SyncPlanItem): boolean {
 		const file = this.app.vault.getAbstractFileByPath(item.path);
